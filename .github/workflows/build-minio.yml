@@ -1,0 +1,99 @@
+name: Build and Push MinIO
+
+on:
+  workflow_dispatch:
+    inputs:
+      minio_version:
+        description: 'MinIO version (e.g., RELEASE.2025-01-15T17-29-55Z or latest)'
+        required: false
+        default: 'latest'
+      image_tag:
+        description: 'Image tag (e.g., 2025.01.15 or latest)'
+        required: false
+        default: 'latest'
+  push:
+    branches:
+      - main
+      - build-minio
+    paths:
+      - '.github/workflows/build-minio.yml'
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM UTC
+
+env:
+  IMAGE_REPO: quay.io/gciavarrini/minio
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Set build parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MINIO_VERSION="${{ github.event.inputs.minio_version }}"
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          else
+            MINIO_VERSION="latest"
+            IMAGE_TAG="latest-$(date +%Y%m%d)"
+          fi
+          
+          echo "minio_version=$MINIO_VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Building MinIO $MINIO_VERSION as ${{ env.IMAGE_REPO }}:$IMAGE_TAG"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build MinIO binary
+        run: |
+          echo "Building MinIO ${{ steps.params.outputs.minio_version }} using go install (recommended method)"
+          go install github.com/minio/minio@${{ steps.params.outputs.minio_version }}
+          
+          # Copy binary to workspace
+          mkdir -p bin
+          cp $(go env GOPATH)/bin/minio bin/
+
+      - name: Create Dockerfile
+        run: |
+          cat > Dockerfile << 'EOF'
+          FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+          
+          ENV MINIO_UPDATE=off
+          
+          COPY bin/minio /usr/bin/minio
+          RUN chmod +x /usr/bin/minio
+          
+          EXPOSE 9000 9001
+          
+          ENTRYPOINT ["/usr/bin/minio"]
+          EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and push multi-arch image
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -t ${{ env.IMAGE_REPO }}:${{ steps.params.outputs.image_tag }} \
+            -t ${{ env.IMAGE_REPO }}:latest \
+            --push \
+            .
+
+      - name: Build summary
+        run: |
+          echo "✅ Image pushed: ${{ env.IMAGE_REPO }}:${{ steps.params.outputs.image_tag }}"
+          echo "Pull: podman pull ${{ env.IMAGE_REPO }}:${{ steps.params.outputs.image_tag }}"
+
