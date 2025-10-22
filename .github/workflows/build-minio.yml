@@ -37,26 +37,60 @@ jobs:
             IMAGE_TAG="${{ github.event.inputs.image_tag }}"
           else
             MINIO_VERSION="latest"
-            IMAGE_TAG="latest-$(date +%Y%m%d)"
+            IMAGE_TAG="scheduled"
           fi
           
           echo "minio_version=$MINIO_VERSION" >> $GITHUB_OUTPUT
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "Building MinIO $MINIO_VERSION as ${{ env.IMAGE_REPO }}:$IMAGE_TAG"
+          echo "Building MinIO $MINIO_VERSION"
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: false
 
       - name: Build MinIO binary
+        id: build
         run: |
-          echo "Building MinIO ${{ steps.params.outputs.minio_version }} using go install (recommended method)"
-          go install github.com/minio/minio@${{ steps.params.outputs.minio_version }}
+          echo "Building MinIO ${{ steps.params.outputs.minio_version }} using go install"
+          echo "Command: go install github.com/minio/minio@${{ steps.params.outputs.minio_version }}"
+          
+          # Build and capture what Go resolved the version to
+          go install -v github.com/minio/minio@${{ steps.params.outputs.minio_version }} 2>&1 | tee build.log
+          
+          # Get the exact version Go installed
+          GO_MODULE_VERSION=$(grep "github.com/minio/minio" build.log | grep -oP '@v[0-9].*|@[A-Z].*' | head -1 | cut -d'@' -f2 || echo "")
           
           # Copy binary to workspace
           mkdir -p bin
           cp $(go env GOPATH)/bin/minio bin/
+          
+          # Get MinIO's actual version from the binary
+          MINIO_VERSION=$(bin/minio --version 2>&1 | grep -oP 'RELEASE\.[0-9T\-Z]+' | head -1)
+          
+          # If we got a version, use it; otherwise fall back
+          if [ -n "$MINIO_VERSION" ]; then
+            ACTUAL_VERSION="$MINIO_VERSION"
+          elif [ -n "$GO_MODULE_VERSION" ]; then
+            ACTUAL_VERSION="$GO_MODULE_VERSION"
+          else
+            ACTUAL_VERSION="latest-$(date +%Y%m%d-%H%M%S)"
+          fi
+          
+          echo "actual_version=$ACTUAL_VERSION" >> $GITHUB_OUTPUT
+          echo ""
+          echo "=========================================="
+          echo "BUILD INFORMATION (for reproducibility)"
+          echo "=========================================="
+          echo "Input version:     ${{ steps.params.outputs.minio_version }}"
+          echo "Go module version: $GO_MODULE_VERSION"
+          echo "MinIO version:     $MINIO_VERSION"
+          echo "Image tag:         $ACTUAL_VERSION"
+          echo ""
+          echo "To reproduce this build:"
+          echo "  go install github.com/minio/minio@$MINIO_VERSION"
+          echo "=========================================="
 
       - name: Create Dockerfile
         run: |
@@ -85,15 +119,44 @@ jobs:
 
       - name: Build and push multi-arch image
         run: |
+          # Determine final tag
+          if [ "${{ steps.params.outputs.image_tag }}" = "scheduled" ]; then
+            VERSION_TAG="${{ steps.build.outputs.actual_version }}"
+          else
+            VERSION_TAG="${{ steps.params.outputs.image_tag }}"
+          fi
+          
+          echo "Pushing image with tags: $VERSION_TAG and latest"
+          
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            -t ${{ env.IMAGE_REPO }}:${{ steps.params.outputs.image_tag }} \
+            -t ${{ env.IMAGE_REPO }}:$VERSION_TAG \
             -t ${{ env.IMAGE_REPO }}:latest \
             --push \
             .
 
       - name: Build summary
         run: |
-          echo "✅ Image pushed: ${{ env.IMAGE_REPO }}:${{ steps.params.outputs.image_tag }}"
-          echo "Pull: podman pull ${{ env.IMAGE_REPO }}:${{ steps.params.outputs.image_tag }}"
+          if [ "${{ steps.params.outputs.image_tag }}" = "scheduled" ]; then
+            VERSION_TAG="${{ steps.build.outputs.actual_version }}"
+          else
+            VERSION_TAG="${{ steps.params.outputs.image_tag }}"
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "✅ BUILD COMPLETE"
+          echo "=========================================="
+          echo "MinIO Version: ${{ steps.build.outputs.actual_version }}"
+          echo ""
+          echo "Images pushed:"
+          echo "  • ${{ env.IMAGE_REPO }}:$VERSION_TAG"
+          echo "  • ${{ env.IMAGE_REPO }}:latest"
+          echo ""
+          echo "Pull command:"
+          echo "  podman pull ${{ env.IMAGE_REPO }}:$VERSION_TAG"
+          echo ""
+          echo "Reproduce build:"
+          echo "  go install github.com/minio/minio@${{ steps.build.outputs.actual_version }}"
+          echo "=========================================="
 
